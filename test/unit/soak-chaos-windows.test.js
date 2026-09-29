@@ -30,7 +30,7 @@ test("every chaos action is covered by a floor claimed before it runs", () => {
 	// fireChaos claims before dispatching, so an action that forgets to claim is still covered
 	const fire = source.slice(source.indexOf("async function fireChaos"));
 	const claim = fire.indexOf("claimWindow(");
-	const dispatch = fire.indexOf("await ACTIONS[name]()");
+	const dispatch = fire.indexOf("await ACTIONS[name](");
 	assert.ok(claim > -1, "fireChaos must claim a window");
 	assert.ok(
 		claim < dispatch,

@@ -1,0 +1,5 @@
+# Soak only, never in the package: `rest` serves resources.js, whose one resource can end the worker it runs on.
+rest: true
+
+jsResource:
+  files: resources.js

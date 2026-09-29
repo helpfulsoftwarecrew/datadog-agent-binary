@@ -4,6 +4,8 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
+import { ACTION_LINE, CHECK_FAILED, CHECK_LINE } from "./soak-threads.mjs";
+
 /** A leg is judged on the supervisor, which is what the matrix measures. */
 const RULES = {
 	/** A request that failed while nothing was being done to the node. */
@@ -17,6 +19,8 @@ const RULES = {
 	pipelineStall: "a delivery pipeline stopped while nothing was being done",
 	/** A chaos action could not be applied, so the leg tested less than it claims. */
 	chaosNotApplied: "a chaos action could not be applied",
+	/** A check the harness ran after a thread action found the agents or the pool wrong. */
+	chaosCheckFailed: "a chaos check failed",
 	/** The run ended early: fewer rows than a minute-per-row run of this length should produce. */
 	endedEarly: "the run produced far fewer rows than its duration",
 	/** Resident memory grew across the run beyond what a steady node does. */
@@ -230,7 +234,15 @@ export function checkLeg(dir, options = {}) {
 		failures.push(`${RULES.chaosNotApplied}: ${notApplied.length}`);
 	stats.chaosActions = chaosLog
 		.split("\n")
-		.filter((l) => /^\d{4}-/.test(l) && !l.includes("after 2 min")).length;
+		.filter((l) => ACTION_LINE.test(l)).length;
+	const checks = chaosLog.split("\n").filter((l) => CHECK_LINE.test(l));
+	const failedChecks = checks.filter((l) => CHECK_FAILED.test(l));
+	stats.chaosChecks = checks.length;
+	stats.chaosChecksFailed = failedChecks.length;
+	if (failedChecks.length)
+		failures.push(
+			`${RULES.chaosCheckFailed}: ${failedChecks.length} of ${checks.length}`
+		);
 
 	// Delivery refused outside chaos is recorded and by default is not a failure, since container DNS can fail while
 	// the host resolves; --strict-delivery makes it one.

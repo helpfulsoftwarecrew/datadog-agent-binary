@@ -3,14 +3,17 @@
 // and one status row a minute from the agents' own intake counters and the container's resource use.
 
 import { execFile, execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
 	appendFileSync,
 	mkdirSync,
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
+import https from "node:https";
 import { homedir, loadavg } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // Harper's own self-signed certificate on the app port.
@@ -32,8 +35,59 @@ const ROOT = process.env.SOAK_ROOT ?? "/home/harperdb/harper";
 const NAMES = ["datadog-trace-agent", "datadog-agent", "datadog-agent-reaper"];
 import { parseStamp, stamp } from "./soak-clock.mjs";
 import { mountsPath, runRecreate, runSpec } from "./soak-container.mjs";
+import {
+	COMPRESSED_MINUTES,
+	STOP_CARRIERS,
+	compressedPlan,
+	describePlan,
+	planDoesNotFit,
+} from "./soak-plan.mjs";
+import {
+	SLOT_EXIT_CAP,
+	bringBackOnThrow,
+	census,
+	censusArgv,
+	censusFailures,
+	checkLine,
+	chooseCount,
+	chooseExits,
+	describePool,
+	harperIdentity,
+	isWorkerAnswer,
+	jobOf,
+	lastingZombies,
+	ops,
+	parseProcStat,
+	parseSeed,
+	poolReplaced,
+	poolView,
+	randomStreams,
+	restartsSeen,
+	signalArgv,
+	slotsUnderCap,
+	stopNotHonoured,
+	tarFiles,
+} from "./soak-threads.mjs";
 
 const HOURS = Number(process.env.SOAK_HOURS ?? 48);
+/** Harper's operations API, published by the container like the app port. */
+const OPS_PORT = Number(process.env.SOAK_OPS_PORT ?? 9925);
+/** "random" draws an action every SOAK_GAP_MIN minutes; "compressed" runs every action once, see soak-plan.mjs. */
+const SCHEDULE = process.env.SOAK_SCHEDULE ?? "random";
+/** Every draw that shapes the chaos comes from this seed, logged at the start so a run can be replayed. */
+const SEED_GIVEN = process.env.SOAK_SEED;
+const SEED = parseSeed(SEED_GIVEN) ?? randomBytes(4).readUInt32BE(0);
+const draw = randomStreams(SEED);
+/** Actions fired first, in order, for a short trial. `name+stop` adds the deliberate stop to a thread action. */
+const FIRST = (process.env.SOAK_ACTIONS ?? "")
+	.split(",")
+	.map((entry) => entry.trim())
+	.filter(Boolean)
+	.map((entry) => {
+		const [name, flag] = entry.split("+");
+		return { name, stop: flag === "stop", flag };
+	});
+const FIRST_MIN = Number(process.env.SOAK_FIRST_MIN ?? 1);
 const RPS = Number(process.env.SOAK_RPS ?? 20);
 const KEY_MIN = Number(process.env.SOAK_KEY_MIN ?? 10);
 const [GAP_MIN, GAP_MAX] = (process.env.SOAK_GAP_MIN ?? "10,30")
@@ -410,6 +464,490 @@ async function livePid(kind, attempts = 6) {
 /** What an action returns when the thing it perturbs is not there to perturb. */
 const notApplicable = (why) => ({ skip: why });
 
+// ---------------------------------------------------------------------------------------------------
+// Worker threads, replaced from outside the node, then the same checks after each.
+
+const CHAOS_COMPONENT = join(
+	dirname(fileURLToPath(import.meta.url)),
+	"chaos-component"
+);
+const PROBES = 40;
+const POOL_WAIT_MS = 180_000;
+const CHECK_WAIT_MS = 90_000;
+/** How long a deliberately stopped agent must stay down: far past the guard's backoff on any restart. */
+const STOP_WINDOW_MS = 60_000;
+/** The pool the leg was installed with, read at the start; a resize draws around it. */
+const workerPool = { installed: null };
+/** Exits spent per slot in the Harper process `harper` names; Harper stops replacing a slot after 50. */
+const budget = {
+	harper: null,
+	spent: /** @type {Record<number, number>} */ ({}),
+};
+
+/** One GET on a connection of its own, so the kernel spreads the probes across the workers. */
+function probe(path) {
+	return new Promise((resolve) => {
+		const request = https.request(
+			{
+				host: "localhost",
+				port: PORT,
+				path,
+				agent: false,
+				rejectUnauthorized: false,
+				headers: { authorization: AUTH },
+				timeout: 5_000,
+			},
+			(response) => {
+				let body = "";
+				response.setEncoding("utf8");
+				response.on("data", (chunk) => (body += chunk));
+				response.on("end", () => {
+					try {
+						resolve(JSON.parse(body));
+					} catch {
+						resolve(null);
+					}
+				});
+			}
+		);
+		request.on("timeout", () => request.destroy());
+		request.on("error", () => resolve(null));
+		request.end();
+	});
+}
+
+async function readPool(rounds = PROBES) {
+	const answers = [];
+	for (let i = 0; i < rounds; i++) answers.push(await probe("/SoakChaos/"));
+	return poolView(answers);
+}
+
+/** @param {(view: ReturnType<typeof poolView>) => boolean} done */
+async function waitForPool(done, timeoutMs = POOL_WAIT_MS) {
+	const until = Date.now() + timeoutMs;
+	let view = await readPool();
+	while (!done(view) && Date.now() < until) {
+		await sleep(3_000);
+		view = await readPool();
+	}
+	return { view, done: done(view) };
+}
+
+/** A call to the operations API as the harness's own user. The body is never logged: a deploy carries a tar. */
+async function operation(body, timeoutMs = 120_000) {
+	const response = await fetch(`http://localhost:${OPS_PORT}/`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: AUTH },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(timeoutMs),
+	});
+	const text = await response.text();
+	if (!response.ok)
+		throw new Error(
+			`${body.operation} answered ${response.status}: ${text.slice(0, 200)}`
+		);
+	try {
+		return JSON.parse(text);
+	} catch {
+		return text;
+	}
+}
+
+async function readProcs() {
+	return parseProcStat((await docker(...censusArgv(CONTAINER))).stdout);
+}
+
+/** Each agent's command, learned the first time its pid is seen running, so one that dies stays expected. */
+const knownAgents = new Map();
+
+/** The agents the leg has run: each the status names whose command was seen, and whether it verifies now. */
+async function agentBaseline() {
+	const s = await status();
+	if (!s?.processes) return null;
+	const commOf = new Map(
+		(await readProcs())
+			.filter((p) => !p.state.startsWith("Z"))
+			.map((p) => [p.pid, p.comm])
+	);
+	for (const p of s.processes)
+		if (Number.isInteger(p.pid) && commOf.has(p.pid))
+			knownAgents.set(String(p.name), String(commOf.get(p.pid)));
+	const agents = s.processes
+		.filter((p) => knownAgents.has(String(p.name)))
+		.map((p) => ({
+			name: String(p.name),
+			comm: String(knownAgents.get(String(p.name))),
+			verified: p.verified === true,
+		}));
+	return agents.length ? agents : null;
+}
+
+function logCheck(n, action, what, failures) {
+	chaosLog(checkLine(n, action, what, failures));
+	return failures;
+}
+
+/**
+ * One live process per agent, each that verified before verifying again as the pid that runs, and no zombie
+ * that lasts across two reads.
+ *
+ * @param {Array<{ name: string, comm: string, verified: boolean }>} agents
+ */
+async function checkAgents(n, action, agents, what, waitMs = CHECK_WAIT_MS) {
+	const comms = agents.map((agent) => agent.comm);
+	const until = Date.now() + waitMs;
+	/** @type {string[]} */
+	let failures;
+	for (;;) {
+		const { live } = census(await readProcs(), comms);
+		failures = censusFailures(live, []);
+		const s = await status();
+		for (const agent of agents.filter((a) => a.verified)) {
+			const now = s?.processes?.find((p) => p.name === agent.name);
+			const pids = live[agent.comm] ?? [];
+			if (!now) failures.push(`the status names no ${agent.name}`);
+			else if (now.verified !== true)
+				failures.push(`${agent.name} does not verify`);
+			else if (pids.length === 1 && now.pid !== pids[0])
+				failures.push(
+					`${agent.name} verifies as pid ${now.pid} while pid ${pids[0]} runs`
+				);
+		}
+		if (!failures.length || Date.now() >= until) break;
+		await sleep(5_000);
+	}
+	const first = census(await readProcs(), comms).zombies;
+	await sleep(5_000);
+	const second = census(await readProcs(), comms).zombies;
+	failures.push(...censusFailures({}, lastingZombies(first, second)));
+	return logCheck(n, action, what, failures);
+}
+
+/**
+ * Restart the node and check the agents once more, so the actions after it start from every agent up and a
+ * later check is not charged with an agent this action left down.
+ *
+ * @param {Array<{ name: string, comm: string, verified: boolean }>} agents
+ */
+async function recover(n, action, agents, why) {
+	chaosLog(`#${n} ${action} recovery: restarting the node, since ${why}`);
+	await restartNode().catch(async (error) => {
+		chaosLog(`#${n} ${action} recovery restart failed: ${failure(error)}`);
+		await restoreContainerIfDown(`#${n} ${action} recovery`);
+	});
+	await checkAgents(n, action, agents, "agents after the recovery restart");
+}
+
+/** The agents check, and when it fails the recovery restart. */
+async function checkAgentsOrRecover(n, action, agents, what) {
+	const failures = await checkAgents(n, action, agents, what);
+	if (failures.length)
+		await recover(n, action, agents, `the check of ${what} failed`);
+	return failures;
+}
+
+/** The exits spent so far, reset when a different Harper process is running. */
+async function spentExits() {
+	const hdbPid = await sh(`cat ${ROOT}/hdb.pid`).catch(() => "");
+	const harper = harperIdentity(await readProcs(), hdbPid);
+	if (harper !== budget.harper) {
+		budget.harper = harper;
+		budget.spent = {};
+	}
+	return budget.spent;
+}
+
+/** Three reads of the status, since each worker answers with the restarts it counted itself. */
+async function restartsNow(name) {
+	const reads = [];
+	for (let i = 0; i < 3; i++) reads.push(await status());
+	return restartsSeen(reads, name);
+}
+
+/**
+ * SIGTERM one running agent after its workers were replaced: the guard must honour it, and an operator's
+ * restart_service must bring it back as one process that verifies.
+ */
+async function deliberateStop(n, action, agents) {
+	const { live } = census(
+		await readProcs(),
+		agents.map((a) => a.comm)
+	);
+	const running = agents.filter((a) => (live[a.comm] ?? []).length === 1);
+	if (!running.length)
+		return logCheck(n, action, "deliberate stop", [
+			"no agent ran as one process to stop",
+		]);
+	const agent = running[Math.floor(draw.threads() * running.length)];
+	const pid = live[agent.comm][0];
+	const counted = await restartsNow(agent.name);
+	return bringBackOnThrow(
+		() => stopThenRestartWorkers(n, action, agents, agent, pid, counted),
+		() =>
+			recover(
+				n,
+				action,
+				agents,
+				`the deliberate stop of ${agent.comm} ended before it was brought back`
+			).catch((error) =>
+				chaosLog(
+					`#${n} ${action} recovery could not check the agents: ${failure(error)}`
+				)
+			)
+	);
+}
+
+/** The SIGTERM, the window the agent must stay down, and the operator's restart_service after it. */
+async function stopThenRestartWorkers(n, action, agents, agent, pid, counted) {
+	await docker(...signalArgv(CONTAINER, pid, "TERM"));
+	const sent = Date.now();
+	chaosLog(
+		`#${n} ${action} deliberate stop sent SIGTERM to ${agent.comm} pid ${pid}; it must stay down ${STOP_WINDOW_MS / 1000} s`
+	);
+	/** @type {string[]} */
+	const restarted = [];
+	while (Date.now() - sent < STOP_WINDOW_MS && !restarted.length) {
+		await sleep(5_000);
+		const again = census(await readProcs(), [agent.comm]).live[
+			agent.comm
+		].filter((p) => p !== pid);
+		if (again.length)
+			restarted.push(
+				`${agent.comm} was restarted as pid ${again.join(", ")} within ${Math.round((Date.now() - sent) / 1000)} s of the SIGTERM`
+			);
+	}
+	const refused = stopNotHonoured(
+		counted,
+		await restartsNow(agent.name),
+		agent.name
+	);
+	if (refused) restarted.push(refused);
+	logCheck(n, action, "deliberate stop honoured", restarted);
+	const before = await readPool();
+	await operation(ops.restartWorkers());
+	const back = await waitForPool((view) =>
+		poolReplaced(before, view, before.workerCount ?? -1)
+	);
+	logCheck(
+		n,
+		action,
+		"operator restart replaced the pool",
+		back.done ? [] : [`the pool reads ${describePool(back.view)}`]
+	);
+	return checkAgentsOrRecover(
+		n,
+		action,
+		agents,
+		"agents after the operator restart"
+	);
+}
+
+/** The deliberate stop, unless the agents check before it failed: a restarted node has no replaced worker. */
+async function stopUnlessRecovered(n, action, agents, failed) {
+	if (!failed.length) return deliberateStop(n, action, agents);
+	chaosLog(
+		`#${n} ${action} deliberate stop not sent: the node was restarted after the agents check failed`
+	);
+}
+
+/**
+ * Replace every worker through `trigger` while Harper stays up, then check the agents, and when `stop` is set
+ * stop one deliberately. `trigger` returns why no worker was replaced, when Harper said so, or null.
+ *
+ * @param {{ n: number, stop: boolean }} context @param {string} action
+ * @param {() => Promise<string | null>} trigger
+ */
+async function replaceEveryWorker({ n, stop }, action, trigger) {
+	if (HOST_MODE) return notApplicable("thread actions drive a docker leg");
+	const agents = await agentBaseline();
+	if (!agents)
+		return notApplicable("the status named no running agent to check after");
+	const before = await readPool();
+	if (!before.workerCount)
+		return notApplicable(
+			"the chaos component did not answer, so no worker can be seen replaced"
+		);
+	const refused = await trigger();
+	if (refused) chaosLog(`#${n} ${action} harper said ${refused}`);
+	else {
+		const { view, done } = await waitForPool((v) =>
+			poolReplaced(before, v, before.workerCount)
+		);
+		logCheck(
+			n,
+			action,
+			"pool replaced",
+			done
+				? []
+				: [
+						`${before.workerCount} workers were not all replaced within ${POOL_WAIT_MS / 1000} s: ${describePool(view)}`,
+					]
+		);
+	}
+	const failed = await checkAgentsOrRecover(n, action, agents, "agents");
+	if (stop) await stopUnlessRecovered(n, action, agents, failed);
+	return { done: true };
+}
+
+/** The chaos component with a stamp that differs every deploy, as the base64 tar deploy_component takes. */
+function chaosPayload(n) {
+	const files = ["config.yaml", "package.json", "resources.js"].map((name) => ({
+		name,
+		data: readFileSync(join(CHAOS_COMPONENT, name), "utf8"),
+	}));
+	files.push({ name: "deployed.txt", data: `${stamp()} #${n}\n` });
+	return tarFiles(files, Date.now() / 1000).toString("base64");
+}
+
+/** What a thread action says it expects, logged before it runs since it checks itself. */
+const THREAD_EXPECT = {
+	"restart-workers":
+		"restart_service replaces every HTTP worker with Harper up; each agent stays one live process, no zombie, and verifies",
+	"exit-random-workers":
+		"chosen worker slots end one at a time and Harper replaces each; each agent stays one live process, no zombie, and verifies",
+	"redeploy-restart":
+		"deploy_component with restart true replaces every HTTP worker; each agent stays one live process, no zombie, and verifies",
+	"redeploy-rolling":
+		"deploy_component with a rolling restart queues a restart job; each agent stays one live process, no zombie, and verifies",
+	"drop-file-restart":
+		"drop_component of one file with restart true replaces every HTTP worker; each agent stays one live process, no zombie, and verifies",
+	"resize-workers":
+		"threads.count changes and the container restarts on it; the pool comes back at that size and each agent as one process that verifies",
+};
+
+const THREAD_ACTIONS = {
+	"restart-workers": (context) =>
+		replaceEveryWorker(context, "restart-workers", async () => {
+			await operation(ops.restartWorkers());
+			return null;
+		}),
+	"redeploy-restart": (context) =>
+		replaceEveryWorker(context, "redeploy-restart", async () => {
+			await operation(ops.deploy(chaosPayload(context.n), true));
+			return null;
+		}),
+	"redeploy-rolling": (context) =>
+		replaceEveryWorker(context, "redeploy-rolling", async () => {
+			const answer = await operation(
+				ops.deploy(chaosPayload(context.n), "rolling")
+			);
+			const id = answer?.restartJobId;
+			if (!id) return "no restart job for the rolling restart";
+			for (let tries = 0; tries < 30; tries++) {
+				const job = jobOf(await operation(ops.job(id)));
+				if (job?.status === "ERROR")
+					return `its restart job ended ERROR (${job.message}); no worker was replaced`;
+				if (job?.status === "COMPLETE") return null;
+				await sleep(2_000);
+			}
+			return "its restart job did not finish within 60 s";
+		}),
+	"drop-file-restart": (context) =>
+		replaceEveryWorker(context, "drop-file-restart", async () => {
+			await operation(ops.setFile("drop-me.txt", `${stamp()}\n`));
+			await operation(ops.dropFile("drop-me.txt"));
+			return null;
+		}),
+	async "exit-random-workers"({ n, stop }) {
+		if (HOST_MODE) return notApplicable("thread actions drive a docker leg");
+		const agents = await agentBaseline();
+		if (!agents)
+			return notApplicable("the status named no running agent to check after");
+		const before = await readPool();
+		if (!before.workerCount)
+			return notApplicable(
+				"the chaos component did not answer, so no worker can be ended"
+			);
+		const spent = await spentExits();
+		const slots = chooseExits(
+			draw.threads,
+			slotsUnderCap(spent, before.workerCount)
+		);
+		if (!slots.length)
+			return notApplicable(
+				`every slot was ended ${SLOT_EXIT_CAP} times in this Harper process`
+			);
+		const failures = [];
+		const replaced = [];
+		for (const slot of slots) {
+			let ended = null;
+			for (let tries = 0; tries < 200 && !ended; tries++) {
+				const answer = await probe(`/SoakChaos/exit-${slot}`);
+				if (isWorkerAnswer(answer) && answer.exiting) ended = answer;
+			}
+			if (!ended) {
+				failures.push(`slot ${slot} did not answer in 200 tries`);
+				continue;
+			}
+			spent[slot] = (spent[slot] ?? 0) + 1;
+			const back = await waitForPool((view) => {
+				const now = view.slots.get(slot);
+				return Boolean(now && now.threadId !== ended.threadId);
+			}, 60_000);
+			if (back.done)
+				replaced.push(
+					`${slot} t${ended.threadId}->t${back.view.slots.get(slot)?.threadId}`
+				);
+			else
+				failures.push(
+					`slot ${slot} (thread ${ended.threadId}) was not replaced within 60 s`
+				);
+		}
+		chaosLog(
+			`#${n} exit-random-workers ended slots ${replaced.join(", ") || "none"} of ${before.workerCount}; exits spent per slot ${JSON.stringify(spent)}`
+		);
+		logCheck(n, "exit-random-workers", "slots replaced", failures);
+		const failed = await checkAgentsOrRecover(
+			n,
+			"exit-random-workers",
+			agents,
+			"agents"
+		);
+		if (stop)
+			await stopUnlessRecovered(n, "exit-random-workers", agents, failed);
+		return { done: true };
+	},
+	async "resize-workers"({ n, stop }) {
+		if (HOST_MODE) return notApplicable("thread actions drive a docker leg");
+		const agents = await agentBaseline();
+		if (!agents)
+			return notApplicable("the status named no running agent to check after");
+		const before = await readPool();
+		if (!before.workerCount)
+			return notApplicable(
+				"the chaos component did not answer, so the pool cannot be counted"
+			);
+		workerPool.installed ??= before.workerCount;
+		const count = chooseCount(
+			draw.threads,
+			before.workerCount,
+			workerPool.installed
+		);
+		chaosLog(
+			`#${n} resize-workers sets threads.count from ${before.workerCount} to ${count} and restarts the container`
+		);
+		await operation(ops.setThreads(count));
+		await restartNode();
+		const { view, done } = await waitForPool(
+			(v) => v.workerCount === count && v.slots.size === count
+		);
+		logCheck(
+			n,
+			"resize-workers",
+			"pool resized",
+			done ? [] : [`the pool reads ${describePool(view)}, not ${count} workers`]
+		);
+		const failed = await checkAgentsOrRecover(
+			n,
+			"resize-workers",
+			agents,
+			"agents"
+		);
+		if (stop) await stopUnlessRecovered(n, "resize-workers", agents, failed);
+		return { done: true };
+	},
+};
+
 const ACTIONS = {
 	async "kill-trace-agent"() {
 		const pid = await livePid("trace");
@@ -516,6 +1054,7 @@ const ACTIONS = {
 			check: async () => (await status())?.delivery?.verdict,
 		};
 	},
+	...THREAD_ACTIONS,
 };
 
 const realApiKey = () =>
@@ -642,37 +1181,67 @@ async function recreate(apiKey) {
 	await runRecreate(run, containerSpec, apiKey);
 }
 
-async function fireChaos() {
-	const skipped = (process.env.SOAK_SKIP ?? "").split(",").filter(Boolean);
+const skippedNames = () =>
+	(process.env.SOAK_SKIP ?? "").split(",").filter(Boolean);
+
+/** The random schedule's next action: any but the last one and the skipped, drawn from the seed. */
+function pickRandom() {
+	const skipped = skippedNames();
 	const names = Object.keys(ACTIONS).filter(
 		(name) => name !== chaos.last && !skipped.includes(name)
 	);
 	const pool = names.length
 		? names
 		: Object.keys(ACTIONS).filter((n) => !skipped.includes(n));
-	const name = pool[Math.floor(Math.random() * pool.length)];
+	const name = pool[Math.floor(draw.chaos() * pool.length)];
+	// Half the time, on the actions that replace every worker with Harper up.
+	const stop = STOP_CARRIERS.includes(name) && draw.threads() < 0.5;
+	return { name, stop };
+}
+
+/** @param {{ name: string, stop?: boolean }} step */
+async function fireChaos({ name, stop = false }) {
+	const compressed = SCHEDULE === "compressed";
 	chaos.count++;
 	chaos.last = name;
+	const n = chaos.count;
 	// The floor: every action claims at least this before it runs, and one that needs longer extends it.
-	claimWindow(HOST_MODE ? MIN_DISRUPTION_MIN_HOST : MIN_DISRUPTION_MIN_DOCKER);
+	claimWindow(
+		compressed
+			? COMPRESSED_MINUTES[name].slot
+			: HOST_MODE
+				? MIN_DISRUPTION_MIN_HOST
+				: MIN_DISRUPTION_MIN_DOCKER
+	);
 	try {
-		const { expect, check, before, skip } = await ACTIONS[name]();
+		if (Object.hasOwn(THREAD_EXPECT, name))
+			chaosLog(
+				`#${n} ${name}${stop ? " with a deliberate stop" : ""}: ${THREAD_EXPECT[name]}`
+			);
+		const { expect, check, before, skip } = await ACTIONS[name]({ n, stop });
 		// Nothing was perturbed, so there is nothing to read back in two minutes. Counted and logged rather
 		// than silent: a run whose chaos keeps skipping is a run that is not testing what it claims to.
 		if (skip) {
 			chaos.results.push({ name, summary: `skipped: ${skip}` });
-			chaosLog(`#${chaos.count} ${name} skipped: ${skip}`);
+			// A compressed run promises every action once, so a skip there fails it.
+			chaosLog(
+				compressed
+					? `#${n} ${name} could not be applied: ${skip}`
+					: `#${n} ${name} skipped: ${skip}`
+			);
 			return;
 		}
-		chaosLog(
-			`#${chaos.count} ${name}${before ? ` (pid ${before})` : ""}: ${expect}`
-		);
-		// Read the outcome after the world has had time to move; two minutes covers a restart and a verify,
-		// and a read that lands inside a pause is retried for a minute more.
+		if (!check) {
+			chaos.results.push({ name, summary: "checked itself; see chaos.log" });
+			return claimWindow(0.25);
+		}
+		chaosLog(`#${n} ${name}${before ? ` (pid ${before})` : ""}: ${expect}`);
+		const minutes = (compressed && COMPRESSED_MINUTES[name].readback) || 2;
+		// Read the outcome after the world has had time to move, and retry a read that lands inside a pause.
 		setTimeout(async () => {
 			// Before reading the outcome, not only after a throw: `docker restart` can report success and leave the
 			// container down. Two minutes in, no action is still holding it down on purpose.
-			await restoreContainerIfDown(`#${chaos.count} ${name}`);
+			await restoreContainerIfDown(`#${n} ${name}`);
 			let observed;
 			for (let attempt = 0; attempt < 6; attempt++) {
 				observed = await check(before).catch(
@@ -691,16 +1260,16 @@ async function fireChaos() {
 					"verdict",
 				]) ?? String(observed);
 			chaos.results.push({ name, summary });
-			chaosLog(`#${chaos.count} ${name} after 2 min: ${summary.slice(0, 300)}`);
-		}, 120_000);
+			chaosLog(`#${n} ${name} after ${minutes} min: ${summary.slice(0, 300)}`);
+		}, minutes * 60_000);
 	} catch (error) {
-		chaosLog(`#${chaos.count} ${name} could not be applied: ${failure(error)}`);
+		chaosLog(`#${n} ${name} could not be applied: ${failure(error)}`);
 		// An action that threw may have got as far as taking the container down. Recovered here as well
 		// as at the readback, so an action that fails outright does not wait two minutes for it.
-		await restoreContainerIfDown(`#${chaos.count} ${name} failed`);
+		await restoreContainerIfDown(`#${n} ${name} failed`);
 	}
 }
-const nextGap = () => (GAP_MIN + Math.random() * (GAP_MAX - GAP_MIN)) * 60_000;
+const nextGap = () => (GAP_MIN + draw.chaos() * (GAP_MAX - GAP_MIN)) * 60_000;
 
 // ---------------------------------------------------------------------------------------------------
 // The status row.
@@ -1082,6 +1651,20 @@ async function main() {
 				: `soak: ${CONTAINER} is not running, so no run configuration was captured; any chaos action that recreates it will refuse`
 		);
 	}
+	const queue = chaosQueue(Date.now());
+	chaosLog(
+		`plan: seed ${SEED}, schedule ${SCHEDULE}${queue.plan ? `, ${describePlan(queue.plan)}` : ""}` +
+			(FIRST.length
+				? `; first ${FIRST.map((f) => f.name + (f.stop ? "+stop" : "")).join(", ")}`
+				: "")
+	);
+	if (!HOST_MODE) {
+		workerPool.installed = (await readPool()).workerCount ?? null;
+		await agentBaseline().catch(() => null);
+	}
+	log(
+		`soak: seed ${SEED}, schedule ${SCHEDULE}, ${workerPool.installed ?? "no count of"} workers answering the chaos component`
+	);
 	const stop = { stopped: false };
 	const stopLoad = startLoad(stop);
 	const end = Date.now() + HOURS * 3_600_000;
@@ -1094,7 +1677,14 @@ async function main() {
 		60_000
 	);
 	await statusRow();
+	let finishing = false;
 	const finish = async () => {
+		if (finishing) return;
+		finishing = true;
+		for (const left of queue.steps.splice(0))
+			chaosLog(
+				`#- ${left.name} could not be applied: the run ended before it fired`
+			);
 		stop.stopped = true;
 		stopLoad();
 		clearInterval(statusTimer);
@@ -1118,13 +1708,63 @@ async function main() {
 	process.on("SIGTERM", finish);
 	process.on("SIGINT", finish);
 	while (Date.now() < end) {
-		if (Date.now() >= nextChaos && Date.now() >= chaos.busyUntil) {
-			await fireChaos();
-			nextChaos = Date.now() + nextGap();
+		if (Date.now() >= chaos.busyUntil) {
+			const due = queue.steps[0];
+			if (due && Date.now() >= due.atMs) {
+				await fireChaos(queue.steps.shift() ?? due);
+				nextChaos = Date.now() + nextGap();
+			} else if (
+				SCHEDULE === "random" &&
+				!queue.steps.length &&
+				Date.now() >= nextChaos
+			) {
+				await fireChaos(pickRandom());
+				nextChaos = Date.now() + nextGap();
+			}
 		}
 		await sleep(5_000);
 	}
 	finish();
+}
+
+/**
+ * The actions with a time of their own: SOAK_ACTIONS first, then in a compressed run the plan. The random
+ * schedule draws the rest as it goes.
+ *
+ * @param {number} startMs
+ */
+function chaosQueue(startMs) {
+	if (SEED_GIVEN !== undefined && parseSeed(SEED_GIVEN) === null)
+		throw new Error("SOAK_SEED must be an unsigned 32-bit integer");
+	if (SCHEDULE !== "random" && SCHEDULE !== "compressed")
+		throw new Error("SOAK_SCHEDULE must be random or compressed");
+	const unknown = FIRST.filter(
+		(f) => !Object.hasOwn(ACTIONS, f.name) || (f.flag && f.flag !== "stop")
+	);
+	if (unknown.length)
+		throw new Error(
+			`SOAK_ACTIONS names what the harness does not do: ${unknown.map((f) => f.name).join(", ")}`
+		);
+	const steps = FIRST.map((f) => ({
+		name: f.name,
+		stop: f.stop,
+		atMs: startMs + FIRST_MIN * 60_000,
+	}));
+	if (SCHEDULE !== "compressed") return { steps, plan: null };
+	const skipped = skippedNames();
+	const plan = compressedPlan(
+		draw.chaos,
+		Object.keys(ACTIONS).filter((name) => !skipped.includes(name))
+	);
+	const tooLong = planDoesNotFit(plan, HOURS);
+	if (tooLong) throw new Error(tooLong);
+	for (const step of plan.steps)
+		steps.push({
+			name: step.name,
+			stop: step.deliberateStop,
+			atMs: startMs + step.atMin * 60_000,
+		});
+	return { steps, plan };
 }
 
 main().catch((error) => {
