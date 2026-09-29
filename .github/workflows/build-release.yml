@@ -1,0 +1,358 @@
+name: Build and Release Datadog Agent Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      datadog_version:
+        description: "Datadog Agent version to build"
+        required: false
+      agent_build_args:
+        description: "Override args for `dda inv agent.build` (e.g. to build a self-contained, Python-free binary). Leave blank for default."
+        required: false
+
+env:
+  # Only the toolchain that RUNS the build tasks.
+  GO_VERSION: "1.23"
+
+jobs:
+  # The single source of the release version, so build and publish agree on it. Nothing else: there is
+  # nothing to compile, so a job that only reads a ref has nothing to hand the matrix.
+  prepare:
+    runs-on: ubuntu-latest
+    # Reading a ref and writing one output. No checkout, no install.
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+    steps:
+      # The package version, from the tag alone. The Datadog version is a different number the build reads from
+      # .datadog-agent-version.
+      - name: Extract version from tag
+        id: extract_version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    # No leg below sets `experimental`, so this is always false: a real failure fails the job
+    # outright, taking release/publish down with it.
+    continue-on-error: false
+    # Caps each leg so a runner that never gets scheduled cannot stall the build and the publish for the default
+    # 6h. A real agent build finishes well within this.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc is compatible only upward and the Harper Pro image is Debian 12 (2.36), so these are pinned
+          # to ubuntu-22.04 (2.35). The floor step below fails the build if either limit is exceeded.
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          # GitHub-hosted arm64 runner on Ubuntu 22.04 (glibc 2.35), the arm counterpart of the x86_64 pin
+          # above.
+          - os: ubuntu-22.04-arm
+            platform: linux-arm64
+
+          # macOS x86_64 is omitted: GitHub retired the macos-13 Intel runner, so it needs a self-hosted or
+          # cross-compiling one.
+          - os: macos-latest
+            platform: macos-arm64
+
+          - os: windows-latest
+            platform: windows-x86_64
+          # Windows arm64 (os: windows-11-arm, platform: windows-arm64) waits on Chocolatey supporting it.
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # Reads package.json's engines.node, the one checked-in source of truth, so no Actions variable drifts from it.
+          node-version-file: "package.json"
+          cache: "npm"
+
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      # The agent build fills the ubuntu image: 73 GiB root with about 12 GiB free at start, no
+      # second volume to move to. None of these paths is loaded by this build; removing them returns ~18 GiB.
+      - name: Reclaim disk space (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          avail() { df --output=avail -k / | tail -1; }
+          before="$(avail)"
+          for path in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost; do
+            [ -e "$path" ] || continue
+            sudo rm -rf "$path" || echo "could not remove $path, continuing"
+          done
+          echo "Reclaimed $(( ($(avail) - before) / 1024 )) MiB on /"
+          df -h /
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        # libsystemd-dev is the journald half.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libsystemd-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake
+
+      # Datadog's build accepts only bazelisk, which reads .bazelversion, and the macOS image ships a system Bazel.
+      # Removed before the build so `inv install-tools` puts its own `bazel` on a PATH nothing else claims.
+      - name: Remove the system Bazel that shadows bazelisk (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew uninstall --ignore-dependencies bazel 2>/dev/null || true
+          sudo rm -f /usr/local/bin/bazel /opt/homebrew/bin/bazel
+          if command -v bazel >/dev/null 2>&1; then
+            echo "::error::A bazel still resolves to $(command -v bazel) after removing the image's. Datadog's build will refuse it; find what put it there before re-running."
+            exit 1
+          fi
+          echo "no bazel on PATH; bazelisk will own the name"
+
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build ${{ matrix.platform }}
+        shell: bash
+        env:
+          DEBUG: true
+          DD_AGENT_BUILD_ARGS: ${{ github.event.inputs.agent_build_args }}
+          # The dispatch input reaches bash as an environment value, never as source. Spliced through ${{ }} it
+          # is shell text, and `7.0.0 ; touch pwned ; #` executes on the runner.
+          DATADOG_VERSION: ${{ github.event.inputs.datadog_version }}
+        run: |
+          args=()
+          if [ -n "$DATADOG_VERSION" ]; then args=(--datadog-version "$DATADOG_VERSION"); fi
+          node agent-build/cli.js build "${args[@]}"
+          ls -l "build/${{ matrix.platform }}/bin/"
+
+      # The agent build starts a Bazel server (the config-schema step does, whatever the rtloader flags say) and
+      # that server outlives the build holding the source tree open.
+      - name: Stop the Bazel daemon the build started
+        if: always()
+        shell: bash
+        env:
+          # `./tools/bazel` refuses an unset XDG_CACHE_HOME under CI instead of shutting the daemon down.
+          XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
+        run: |
+          mkdir -p "$XDG_CACHE_HOME"
+          cd "build/${{ matrix.platform }}/src" || exit 0
+          ./tools/bazel shutdown || bazel shutdown || echo "no bazel to shut down"
+
+      # Proves the binaries are real before they ship, on every OS including Windows, whose runner has bash too.
+      # The script hides build/<platform>/src itself.
+      - name: Smoke test ${{ matrix.platform }} binaries
+        shell: bash
+        run: node test/binaries/smoke.js "build/${{ matrix.platform }}/bin"
+
+      # The equivalence property against these real binaries on every leg: both supervisors deliver the same trace
+      # count for the same input.
+      - name: Supervision equivalence test (native vs guard, real binaries)
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            node test/windows-gate.mjs --binaries
+          else
+            node --test --test-concurrency=1 --test-timeout=120000 "test/binaries/**/*.test.js"
+          fi
+
+      # Guard against the symbol floor creeping back up. The Harper Pro runtime image (Debian 12) provides glibc
+      # 2.36 (libc.so.6) AND libstdc++ GLIBCXX_3.4.30 (from GCC 12).
+      - name: Verify glibc / libstdc++ floor (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          # Derived, not hardcoded: a second binary added to BINARIES is covered here automatically.
+          bins=$(node -e "console.log(require('./agent-build/binaries.js').BINARIES.map(b=>b.shipsAs).join(' '))")
+
+          check() {
+            bin="$1"; label="$2"; prefix="$3"; limit="$4"
+            # GLIBC_ won't match GLIBCXX_ (char after GLIBC is X, not _), so the
+            # two families are counted independently.
+            max=$(strings -a "$bin" | grep -o "${prefix}_[0-9.]\+" | sed "s/${prefix}_//" | sort -uV | tail -1)
+            echo "${label}: binary references up to ${prefix}_${max:-<none>}; image provides ${prefix}_${limit}"
+            if [ -n "$max" ] && [ "$(printf '%s\n%s\n' "$limit" "$max" | sort -V | tail -1)" != "$limit" ]; then
+              echo "::error::${bin} requires ${prefix}_${max} but the Harper Pro runtime image only provides ${prefix}_${limit}. Build on an older toolchain (glibc <= 2.36, GCC <= 12) so the agent loads on the image."
+              return 1
+            fi
+            return 0
+          }
+
+          rc=0
+          for name in $bins; do
+            bin="build/${{ matrix.platform }}/bin/${name}"
+            check "$bin" "${name} glibc"     "GLIBC"   "2.36"   || rc=1
+            check "$bin" "${name} libstdc++" "GLIBCXX" "3.4.30" || rc=1
+          done
+          if [ "$rc" -eq 0 ]; then
+            echo "OK: all binaries stay within the Harper Pro image's glibc and libstdc++ versions."
+          fi
+          exit "$rc"
+
+      # Named the way the kit's release workflow reads them back, so nothing between here and staging has to
+      # translate one convention into another.
+      - name: Upload ${{ matrix.platform }} artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bin-${{ matrix.platform }}
+          path: build/${{ matrix.platform }}/bin/
+          retention-days: 90
+
+      # Its own artifact, not folded into bin-*, because the release job treats every bin-* directory as one
+      # platform's binary set and would package 42MB of eBPF objects as if they were binaries.
+      - name: Upload ${{ matrix.platform }} eBPF objects
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: share-${{ matrix.platform }}
+          path: build/${{ matrix.platform }}/share/
+          if-no-files-found: ignore
+          retention-days: 90
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    # GitHub's release-creation API is the only external call here; it doesn't hang for hours.
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Named by pattern, not unfiltered: the loop below turns every entry under artifacts/ into a
+      # release asset, so the eBPF objects a Linux leg uploads must not silently become one.
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bin-*
+          path: artifacts/
+
+      # Git permits ; $() ` && and | in a tag name, so ref_name spliced into a run body is shell source. It
+      # arrives as a value, like every other untrusted input in this workflow.
+      - name: Prepare release assets
+        id: prepare_assets
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          mkdir -p release-assets
+          platforms_file="$RUNNER_TEMP/platforms.md"
+          : > "$platforms_file"
+
+          cd artifacts
+
+
+          for artifact in bin-*; do
+            [ -d "$artifact" ] || continue
+            platform=${artifact#bin-}
+            os=${platform%%-*}
+            arch=${platform#*-}
+            case "$os" in
+              linux) label="Linux" ;;
+              macos) label="macOS" ;;
+              windows) label="Windows" ;;
+              *) label="$os" ;;
+            esac
+
+            cd "$artifact"
+            if [ "$os" = "windows" ]; then
+              file="datadog-agent-${REF_NAME}-${platform}.zip"
+              zip -r "../../release-assets/${file}" ./*
+            else
+              file="datadog-agent-${REF_NAME}-${platform}.tar.gz"
+              tar -czf "../../release-assets/${file}" ./*
+            fi
+            echo "- **${label} ${arch}**: \`${file}\`" >> "$platforms_file"
+            cd ..
+          done
+
+
+          {
+            echo "platforms<<PLATFORMS_EOF"
+            cat "$platforms_file"
+            echo "PLATFORMS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum ./* > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: datadog-agent-binary ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release-assets/*
+          body: |
+            # @helpfulsoftwarecrew/datadog-agent-binary ${{ github.ref_name }}
+
+            Pre-compiled Datadog Agent binaries for all supported platforms.
+
+            # # Supported Platforms
+
+            ${{ steps.prepare_assets.outputs.platforms }}
+
+            # # NPM Package
+
+            ```bash
+            npm install @helpfulsoftwarecrew/datadog-agent-binary
+            ```
+
+            # # Verification
+
+            ```bash
+            sha256sum -c checksums.txt
+            ```
+
+  # Staging, the symbol floors, the gate, the publish and the dist-tag move are the kit's reusable workflow.
+  publish:
+    needs: [build, prepare]
+    if: startsWith(github.ref, 'refs/tags/')
+    # A tag that exists, or GitHub reports the whole workflow invalid at trigger time and the tag push runs
+    # nothing at all, with no job to read the reason off.
+    uses: helpfulsoftwarecrew/harper-binary-kit/.github/workflows/release.yml@v1.0.0-rc.1
+    # Granted here, not in the callee: a called workflow's own `permissions` block is ignored, and the caller
+    # asking for less than it needs fails the run before any job starts.
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      targets: '["linux-x86_64", "linux-arm64", "macos-arm64", "windows-x86_64"]'
+    secrets:
+      # The first publish of each name, since a trusted publisher needs a package that exists, and dist-tag writes.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

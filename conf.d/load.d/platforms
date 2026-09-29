@@ -1,0 +1,2 @@
+# Windows has no load average and the check is a stub there; upstream's Windows package omits load.d too.
+linux darwin

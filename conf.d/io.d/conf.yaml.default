@@ -1,0 +1,7 @@
+# system.io.*: per-device read/write rates, await and utilization. Every value is a rate, so a fresh agent's
+# first run emits nothing; device_exclude_re is left unset, as upstream leaves it.
+
+init_config:
+
+instances:
+  - {}

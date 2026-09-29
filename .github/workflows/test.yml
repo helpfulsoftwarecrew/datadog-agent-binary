@@ -1,0 +1,62 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["22", "24"]
+    runs-on: ${{ matrix.os }}
+    # A full install + build + test run finishes well within this; caps a stuck leg.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run lint:check
+
+      - name: Type check
+        run: npm run typecheck
+
+      # npm's own quoting keeps this pattern out of sh's hands on the ubuntu/macos legs, where an
+      # unquoted `**` would expand as a plain `*` without globstar; --test resolves it instead, and only from Node 22.
+      - name: Run tests
+        if: runner.os != 'Windows'
+        run: npm test
+
+      # Windows runs the same two directories through test/windows-gate.mjs, which subtracts the suites
+      # observed to fail there and refuses a run that executed nothing. Its header states every exclusion.
+      - name: Run tests (Windows gate)
+        if: runner.os == 'Windows'
+        run: npm run test:windows
+
+      # node --test exits 0 when its pattern matches nothing, so a renamed directory would turn the step above
+      # into a no-op that reports success.
+      - name: Guard against an empty test glob
+        shell: bash
+        run: |
+          count=$(find test/unit test/system -type f -name '*.test.js' | wc -l | tr -d ' ')
+          echo "Found $count *.test.js file(s) under test/unit and test/system:"
+          find test/unit test/system -type f -name '*.test.js' | sort | sed 's/^/  /'
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No *.test.js files under test/unit or test/system; the test step ran nothing."
+            exit 1
+          fi

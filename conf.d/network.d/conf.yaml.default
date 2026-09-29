@@ -1,0 +1,7 @@
+# system.net.*: per-interface bytes and packets, TCP/UDP counters. collect_connection_state shells out to
+# enumerate sockets and is the expensive option, so it stays off, as upstream leaves it.
+
+init_config:
+
+instances:
+  - collect_connection_state: false

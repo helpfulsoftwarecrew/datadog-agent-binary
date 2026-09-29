@@ -1,0 +1,7 @@
+# system.mem.* and system.swap.*. collect_memory_pressure stays off, as upstream leaves it: the pressure its
+# reclaim counters describe shows up in system.mem.usable first.
+
+init_config:
+
+instances:
+  - {}

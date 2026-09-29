@@ -1,0 +1,7 @@
+# system.disk.* and system.fs.inodes.*, one set per partition, pseudo-filesystems included; use_mount false is
+# upstream's. include_all_devices, mount_point_exclude and file_system_exclude trim the tag cardinality.
+
+init_config:
+
+instances:
+  - use_mount: false

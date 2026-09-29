@@ -1,0 +1,7 @@
+# system.fs.file_handles.used and .max, shipped on macOS too: the check has a darwin build that upstream's
+# packaging omits, and running out of descriptors fails a database node the same way on a Mac.
+
+init_config:
+
+instances:
+  - {}

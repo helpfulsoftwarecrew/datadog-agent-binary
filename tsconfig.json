@@ -1,0 +1,34 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "node16",
+		"moduleResolution": "node16",
+		"lib": ["ES2022"],
+		// TS7 stops auto-including node_modules/@types; without this every `process` reference dies on TS2591.
+		"types": ["node"],
+		// Nothing is emitted: `allowJs` plus `checkJs` is the whole product, with no build step and no dist/.
+		"noEmit": true,
+		"allowJs": true,
+		"checkJs": true,
+		"strict": true,
+		"noImplicitAny": false,
+		"strictNullChecks": false,
+		"esModuleInterop": true,
+		// The guard and the kit ship plain JS with JSDoc and no declarations, so their types are read from source.
+		"maxNodeModuleJsDepth": 1,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"allowSyntheticDefaultImports": true
+	},
+	// Everything that ships is checked, runtime/ included, since it is the half a customer runs.
+	"include": [
+		"types/**/*.d.ts",
+		"agent-build/**/*.js",
+		"runtime/**/*.js",
+		"resources.js",
+		"binary-kit.config.js",
+		"test/**/*.js",
+		"test/**/*.mjs"
+	]
+}

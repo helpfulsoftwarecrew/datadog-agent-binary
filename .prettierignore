@@ -1,0 +1,8 @@
+node_modules/
+dist/
+build/
+go/
+source/
+release/
+*.md
+package-lock.json

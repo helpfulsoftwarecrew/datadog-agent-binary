@@ -1,0 +1,106 @@
+// Which binaries this package compiles and which it lifts out of Datadog's signed release. The split is a
+// measurement, not a preference, and these assert the measurement rather than the intent.
+
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+
+import {
+	BINARIES,
+	binariesFor,
+	builtFor,
+	extractedFor,
+} from "../../agent-build/binaries.js";
+import { TARGETS } from "../../agent-build/toolchain.js";
+
+describe("where each binary comes from", () => {
+	it("only the core agent and the trace-agent are built here", () => {
+		// Only the core agent links libdatadog-agent-rtloader, so only it must be compiled to come out Python-free.
+		assert.deepEqual(
+			BINARIES.filter((b) => b.from === "build").map((b) => b.shipsAs),
+			["datadog-agent", "trace-agent"]
+		);
+	});
+
+	it("system-probe and security-agent are lifted from the release", () => {
+		// system-probe's eBPF objects must match the operator's kernels; Datadog precompiles 26, a runner cannot.
+		assert.deepEqual(
+			BINARIES.filter((b) => b.from === "release").map((b) => b.shipsAs),
+			["system-probe", "process-agent", "security-agent"]
+		);
+	});
+
+	it("NEGATIVE: every descriptor declares a source, so none defaults into the build path", () => {
+		for (const binary of BINARIES)
+			assert.ok(
+				binary.from === "build" || binary.from === "release",
+				`${binary.shipsAs} has no source: ${JSON.stringify(binary.from)}`
+			);
+	});
+
+	it("the two views partition the binaries for every target, losing none", () => {
+		// A binary in neither view is one that silently stops shipping.
+		for (const target of TARGETS) {
+			const all = binariesFor(target)
+				.map((b) => b.shipsAs)
+				.sort();
+			const split = [...builtFor(target), ...extractedFor(target)]
+				.map((b) => b.shipsAs)
+				.sort();
+			assert.deepEqual(
+				split,
+				all,
+				`${target.name} loses a binary between the two views`
+			);
+			assert.equal(
+				new Set(split).size,
+				split.length,
+				`${target.name} has a binary in both views`
+			);
+		}
+	});
+
+	// Linux system-probe cannot be built on a runner: the eBPF objects need a kernel-header tree matched to every
+	// kernel an operator might run, which is why Datadog precompiles 26 of them.
+	it("system-probe is lifted on Linux and built everywhere else", () => {
+		const named = (fn, os) =>
+			fn(TARGETS.find((t) => t.os === os)).map((b) => b.shipsAs);
+		assert.ok(
+			named(extractedFor, "linux").includes("system-probe"),
+			"Linux builds system-probe, which needs a kernel-header tree per target"
+		);
+		for (const os of ["macos", "windows"]) {
+			assert.ok(
+				named(builtFor, os).includes("system-probe"),
+				`${os} does not build system-probe, and cannot lift it from a Debian package`
+			);
+			assert.ok(!named(extractedFor, os).includes("system-probe"));
+		}
+	});
+
+	// security-agent is lifted on Linux and built on Windows, because the extraction source is a Debian
+	// package. A Windows leg that lifted it would refuse the build for an artefact that cannot exist.
+	it("security-agent is lifted on Linux and built on Windows", () => {
+		const named = (fn, os) =>
+			fn(TARGETS.find((t) => t.os === os)).map((b) => b.shipsAs);
+		assert.ok(named(extractedFor, "linux").includes("security-agent"));
+		assert.ok(named(builtFor, "windows").includes("security-agent"));
+		assert.ok(!named(extractedFor, "windows").includes("security-agent"));
+	});
+
+	it("macOS extracts nothing, because neither release binary exists there", () => {
+		// Everything macOS ships is built there, so it needs no artefact from Datadog.
+		const macos = TARGETS.find((t) => t.os === "macos");
+		assert.deepEqual(
+			extractedFor(macos).map((b) => b.shipsAs),
+			[]
+		);
+	});
+
+	it("Linux extracts both, which is where the toolchain pain was", () => {
+		const linux = TARGETS.find((t) => t.os === "linux");
+		assert.deepEqual(
+			extractedFor(linux).map((b) => b.shipsAs),
+			["system-probe", "process-agent", "security-agent"]
+		);
+	});
+});

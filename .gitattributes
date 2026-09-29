@@ -1,0 +1,15 @@
+# LF everywhere: Windows CI would check files out as CRLF, and `prettier --check` (endOfLine lf) flags every one.
+* text=auto eol=lf
+
+# Shell scripts must stay LF to run.
+*.sh text eol=lf
+
+# Binary assets are never normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.tgz binary
+*.zip binary

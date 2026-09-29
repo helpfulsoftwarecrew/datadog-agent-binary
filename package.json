@@ -1,0 +1,73 @@
+{
+	"name": "@helpfulsoftwarecrew/datadog-agent-binary",
+	"version": "8.0.0-rc.1",
+	"description": "Harper component that runs the Datadog trace-agent and core-agent alongside a node, with pre-built binaries installed per platform",
+	"type": "module",
+	"scripts": {
+		"start": "node agent-build/cli.js",
+		"// typecheck": "checkJs over everything that ships, runtime/ included, since nothing here compiles",
+		"typecheck": "tsc --noEmit",
+		"clean": "rm -rf build/ npm/",
+		"build-agent": "node agent-build/cli.js build",
+		"// stage": "the kit's own commands, for seeing what a release would publish; the release runs them itself",
+		"stage": "harper-binary-kit stage",
+		"verify-package": "harper-binary-kit verify",
+		"update-optional-deps": "harper-binary-kit deps --write",
+		"lint": "prettier --write .",
+		"lint:check": "prettier --check .",
+		"// prepare": "husky is a devDependency and Harper's npm install of the component runs prepare; cmd.exe has no true",
+		"prepare": "husky || exit 0",
+		"version": "npm run update-optional-deps",
+		"// test": "node --test has no timeout by default, so a supervision hang would read as a stuck machine",
+		"test": "node --test --test-timeout=120000 \"test/unit/**/*.test.js\" \"test/system/**/*.test.js\"",
+		"// test:windows": "the Windows stand-in for test, minus what test/windows-gate-checks.mjs excludes; an empty run fails",
+		"test:windows": "node test/windows-gate.mjs",
+		"test:live": "node --test \"test/live/**/*.test.js\"",
+		"// test:binaries": "needs real binaries at build/<platform>/bin, from npm run build-agent",
+		"test:binaries": "node --test --test-concurrency=1 --test-timeout=120000 \"test/binaries/**/*.test.js\""
+	},
+	"keywords": [
+		"datadog",
+		"agent",
+		"build",
+		"cross-platform"
+	],
+	"author": "HelpfulSoftwareCrew",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"@helpfulsoftwarecrew/harper-binary-kit": "1.0.0-rc.1",
+		"@helpfulsoftwarecrew/harper-process-guard": "1.0.0-rc.1"
+	},
+	"devDependencies": {
+		"@types/node": "^26.5.1",
+		"commander": "^15.0.0",
+		"dd-trace": "^6.15.0",
+		"husky": "^9.1.7",
+		"lint-staged": "^17.5.1",
+		"prettier": "^3.9.6",
+		"typescript": "^7.0.2"
+	},
+	"files": [
+		"conf.d/",
+		"config.yaml",
+		"resources.js",
+		"runtime/",
+		"README.md"
+	],
+	"engines": {
+		"node": "^22.18.0 || >=24.0.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/helpfulsoftwarecrew/datadog-agent-binary.git"
+	},
+	"bugs": {
+		"url": "https://github.com/helpfulsoftwarecrew/datadog-agent-binary/issues"
+	},
+	"homepage": "https://github.com/helpfulsoftwarecrew/datadog-agent-binary#readme",
+	"lint-staged": {
+		"*.{ts,js,mjs,json,md,yml,yaml}": [
+			"prettier --check"
+		]
+	}
+}

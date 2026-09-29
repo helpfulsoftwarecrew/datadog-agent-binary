@@ -1,0 +1,7 @@
+# system.cpu.*: user, system, idle, iowait, steal, guest and num_cores. The instance is the empty one upstream
+# ships; report_total_percpu, its one option, turns one series into one per core.
+
+init_config:
+
+instances:
+  - {}
