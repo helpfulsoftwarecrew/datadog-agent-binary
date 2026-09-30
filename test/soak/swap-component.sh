@@ -5,7 +5,7 @@ set -e
 V="$1"
 H=/home/harperdb/harper
 echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
-	|| { echo "REFUSED: \"$V\" is not an exact version such as 8.0.0-rc.1"; exit 1; }
+	|| { echo "REFUSED: \"$V\" is not an exact version such as 8.0.0"; exit 1; }
 STAGE="$H/.staging/dab-$V"
 LIVE="$H/components/datadog-agent-binary"
 

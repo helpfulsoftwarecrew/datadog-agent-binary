@@ -8,7 +8,7 @@ H=/home/harperdb/harper
 
 # An exact version, never a dist-tag: a tag stages whatever it names on the day, not the candidate under test.
 echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
-	|| { echo "REFUSED: \"$V\" is not an exact version such as 8.0.0-rc.1"; exit 1; }
+	|| { echo "REFUSED: \"$V\" is not an exact version such as 8.0.0"; exit 1; }
 case "$T" in
 	linux-x86_64|linux-arm64) ;;
 	*) echo "REFUSED: \"$T\" is not linux-x86_64 or linux-arm64"; exit 1 ;;
