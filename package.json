@@ -69,5 +69,11 @@
 		"*.{ts,js,mjs,json,md,yml,yaml}": [
 			"prettier --check"
 		]
+	},
+	"optionalDependencies": {
+		"@helpfulsoftwarecrew/datadog-agent-binary-linux-x86_64": "8.0.0",
+		"@helpfulsoftwarecrew/datadog-agent-binary-linux-arm64": "8.0.0",
+		"@helpfulsoftwarecrew/datadog-agent-binary-macos-arm64": "8.0.0",
+		"@helpfulsoftwarecrew/datadog-agent-binary-windows-x86_64": "8.0.0"
 	}
 }
