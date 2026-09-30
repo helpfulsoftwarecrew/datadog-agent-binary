@@ -188,20 +188,32 @@ export async function plantBuiltBinaries(run, command = EXITS_AT_ONCE) {
 }
 
 /**
- * The real agent binaries already at build/<platform>/bin, under the same exclusive lock withBuiltBinaries
- * takes.
+ * The real agent binaries already at build/<platform>/bin, with an installed platform package's hidden, under
+ * the same exclusive lock withBuiltBinaries takes.
  */
 export async function withRealBinaries(run) {
-	return withResolveBinaryLock(async () => {
-		const { files } = builtBinaryPaths();
-		const missing = files.filter((file) => !fs.existsSync(file));
-		if (missing.length) {
-			throw new Error(
-				`real agent binaries are missing: ${missing.join(", ")}. Run \`npm run build-agent\` first.`
-			);
-		}
-		return run(files);
-	});
+	return withResolveBinaryLock(() => useRealBinaries(run));
+}
+
+/**
+ * {@link withRealBinaries} without the lock, for test/system/built-binaries-fixture.test.js, which holds the
+ * lock across its own staging of the same paths.
+ */
+export async function useRealBinaries(run) {
+	const { files } = builtBinaryPaths();
+	const missing = files.filter((file) => !fs.existsSync(file));
+	if (missing.length) {
+		throw new Error(
+			`real agent binaries are missing: ${missing.join(", ")}. Run \`npm run build-agent\` first.`
+		);
+	}
+	// resolveBinary asks an installed platform package first, so one left in place would run instead of the build.
+	const restore = hideFiles(installedPlatformBinaries());
+	try {
+		return await run(files);
+	} finally {
+		restore();
+	}
 }
 
 /**

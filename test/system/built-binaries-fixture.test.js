@@ -11,11 +11,15 @@ import {
 	builtBinaryPaths,
 	hideFiles,
 	plantBuiltBinaries,
+	REPO_ROOT,
 	stub,
 	STAYS_UP,
 	UNEXECUTABLE,
+	useRealBinaries,
 } from "../support/component.js";
+import { currentTarget } from "../support/repo.js";
 import { withTempDir } from "../support/sandbox.js";
+import { PACKAGE_NAME, resolveBinary } from "../../runtime/datadog.js";
 
 const HIDDEN = ".hidden-by-fixture";
 const SAVED = ".saved-by-test";
@@ -202,6 +206,86 @@ test("the built-binaries fixture puts back what it found at build/<platform>/bin
 			);
 		});
 	} finally {
+		restoreReal?.();
+		release();
+	}
+});
+
+// Marks a package directory as this file's stand-in, so a run killed before its put-back never saves one aside.
+const FAKE_PACKAGE = ".planted-by-test";
+
+/**
+ * A platform package at `dir` answering every binary from its own bin/, and the put-back of whatever was there.
+ */
+function plantPlatformPackage(dir, exe) {
+	const saved = `${dir}${SAVED}`;
+	if (fs.existsSync(path.join(dir, FAKE_PACKAGE)))
+		fs.rmSync(dir, { recursive: true });
+	else if (fs.existsSync(dir)) fs.renameSync(dir, saved);
+	fs.mkdirSync(path.join(dir, "bin"), { recursive: true });
+	fs.writeFileSync(path.join(dir, FAKE_PACKAGE), "");
+	fs.writeFileSync(
+		path.join(dir, "package.json"),
+		JSON.stringify({
+			name: path.basename(dir),
+			version: "0.0.0",
+			main: "index.js",
+		})
+	);
+	fs.writeFileSync(
+		path.join(dir, "index.js"),
+		`const path = require("path");\nexports.getBinaryPath = (name) => path.join(__dirname, "bin", name + ${JSON.stringify(exe)});\n`
+	);
+	for (const name of ["datadog-agent", "trace-agent"])
+		writeExecutable(path.join(dir, "bin", `${name}${exe}`), stub("exit 0"));
+	return () => {
+		fs.rmSync(dir, { recursive: true, force: true });
+		if (fs.existsSync(saved)) fs.renameSync(saved, dir);
+	};
+}
+
+// resolveBinary asks an installed platform package before build/<platform>/bin, and `npm ci` installs one.
+test("NEGATIVE: the real-binaries fixture resolves the build, not an installed platform package", async () => {
+	const target = currentTarget();
+	const { binDir, files } = builtBinaryPaths();
+	fs.mkdirSync(binDir, { recursive: true });
+	const built = files.find(
+		(file) => path.basename(file) === `trace-agent${target.exe}`
+	);
+	const dir = path.join(
+		REPO_ROOT,
+		"node_modules",
+		`${PACKAGE_NAME}-${target.name}`
+	);
+	const installed = path.join(dir, "bin", `trace-agent${target.exe}`);
+	const release = await acquireResolveBinaryLock();
+	let restoreReal;
+	let restorePackage;
+	try {
+		restoreReal = saveAside(files);
+		for (const file of files) writeExecutable(file, stub("exit 0"));
+		restorePackage = plantPlatformPackage(dir, target.exe);
+		// Without this the fixture could pass for having had nothing to hide.
+		assert.equal(
+			await resolveBinary({ shipsAs: "trace-agent" }),
+			installed,
+			"the planted platform package did not answer, so this proves nothing"
+		);
+
+		const resolved = await useRealBinaries(() =>
+			resolveBinary({ shipsAs: "trace-agent" })
+		);
+		assert.equal(
+			resolved,
+			built,
+			"the real-binaries fixture resolved the installed platform package's trace-agent, not the build it names"
+		);
+		assert.ok(
+			fs.existsSync(installed),
+			"the installed platform package's binary was not put back"
+		);
+	} finally {
+		restorePackage?.();
 		restoreReal?.();
 		release();
 	}
