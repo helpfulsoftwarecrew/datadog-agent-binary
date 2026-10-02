@@ -184,3 +184,12 @@ test("NEGATIVE: a prerelease tag stops the release in prepare, with the reason",
 		"the GitHub release still has a prerelease switch"
 	);
 });
+
+// The kit's workflow publishes through trusted publishing alone and declares no secret, so a caller passing
+// one fails the call, and a token here is one npm would ask a one-time password of.
+test("NEGATIVE: the publish job hands the kit no token", () => {
+	const publish = WORKFLOW.slice(WORKFLOW.indexOf("\n  publish:"));
+	assert.ok(publish.length > 1, "the publish job was not found");
+	assert.doesNotMatch(publish, /^\s+secrets:/m);
+	assert.doesNotMatch(WORKFLOW, /NPM_TOKEN|NODE_AUTH_TOKEN/);
+});

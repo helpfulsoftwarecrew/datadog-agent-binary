@@ -342,13 +342,14 @@ jobs:
             sha256sum -c checksums.txt
             ```
 
-  # Staging, the symbol floors, the gate, the publish and the dist-tag move are the kit's reusable workflow.
+  # Staging, the symbol floors, the gate and the publish are the kit's reusable workflow, which publishes through
+  # each package's trusted publisher alone and picks each one's dist-tag before its publish.
   publish:
     needs: [build, prepare]
     if: startsWith(github.ref, 'refs/tags/')
     # A tag that exists, or GitHub reports the whole workflow invalid at trigger time and the tag push runs
     # nothing at all, with no job to read the reason off.
-    uses: helpfulsoftwarecrew/harper-binary-kit/.github/workflows/release.yml@v1.0.0
+    uses: helpfulsoftwarecrew/harper-binary-kit/.github/workflows/release.yml@v1.0.2
     # Granted here, not in the callee: a called workflow's own `permissions` block is ignored, and the caller
     # asking for less than it needs fails the run before any job starts.
     permissions:
@@ -357,6 +358,3 @@ jobs:
     with:
       version: ${{ needs.prepare.outputs.version }}
       targets: '["linux-x86_64", "linux-arm64", "macos-arm64", "windows-x86_64"]'
-    secrets:
-      # The first publish of each name, since a trusted publisher needs a package that exists, and dist-tag writes.
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
