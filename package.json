@@ -35,8 +35,8 @@
 	"author": "HelpfulSoftwareCrew",
 	"license": "Apache-2.0",
 	"dependencies": {
-		"@helpfulsoftwarecrew/harper-binary-kit": "1.0.0",
-		"@helpfulsoftwarecrew/harper-process-guard": "1.0.0"
+		"@helpfulsoftwarecrew/harper-binary-kit": "1.0.2",
+		"@helpfulsoftwarecrew/harper-process-guard": "1.0.1"
 	},
 	"devDependencies": {
 		"@types/node": "^26.5.1",
