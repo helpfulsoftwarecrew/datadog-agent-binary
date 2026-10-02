@@ -50,7 +50,7 @@ test("a release with no pin leaves the toolchain to go.mod", async () => {
 // The failure that matters is a silent one: setting GOTOOLCHAIN to something Go cannot parse would make
 // every build fail with a message about the variable rather than about the file it came from.
 test("NEGATIVE: a .go-version that is not a version sets no toolchain at all", async () => {
-	for (const junk of ["latest", "go1.26.5", "1.26.5-rc1", "", "  ", "auto"]) {
+	for (const junk of ["latest", "go1.26.5", "1.26.5-beta1", "", "  ", "auto"]) {
 		assert.deepEqual(
 			goToolchain(junk),
 			{},

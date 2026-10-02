@@ -110,7 +110,6 @@ a process that exits every time.
 
 - Native supervision through Harper's `scope.processes` is proven against a Harper branch, not a release.
 - The Windows leg proves the binaries bind and serve, not the supervision equivalence property. `AGENTS.md` has the reason.
-- Until 8.0.0 ships, `latest` on npm names the release candidate, and `@next` is the same version.
 
 ## License
 
