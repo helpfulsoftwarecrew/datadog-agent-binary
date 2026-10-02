@@ -3,7 +3,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import {
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { REPO_ROOT } from "../support/repo.js";
@@ -128,4 +135,52 @@ test("the publish job calls the kit and passes the targets the config declares",
 test("the artifact names are the ones the kit reads back", () => {
 	assert.match(WORKFLOW, /name: bin-\$\{\{ matrix\.platform \}\}/);
 	assert.match(WORKFLOW, /name: share-\$\{\{ matrix\.platform \}\}/);
+});
+
+/** The prepare job's version step, run the way the runner runs it, with an output file to read back. */
+function extractVersion(ref) {
+	const body = scriptBodies(WORKFLOW).find((script) =>
+		script.includes('"$GITHUB_REF" == refs/tags/v*')
+	);
+	assert.ok(body, "the version extraction step was not found");
+	const dir = mkdtempSync(join(tmpdir(), "extract-version-"));
+	const output = join(dir, "output");
+	writeFileSync(output, "");
+	try {
+		const stdout = execFileSync("bash", ["-c", body], {
+			encoding: "utf8",
+			env: { ...process.env, GITHUB_REF: ref, GITHUB_OUTPUT: output },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		return { status: 0, stdout, output: readFileSync(output, "utf8") };
+	} catch (caught) {
+		const error = /** @type {{ status: number, stdout: string }} */ (caught);
+		return { status: error.status, stdout: String(error.stdout), output: "" };
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// No prerelease is published, and stopping in prepare spares four agent builds and a GitHub release.
+test("NEGATIVE: a prerelease tag stops the release in prepare, with the reason", (t) => {
+	if (process.platform === "win32")
+		return t.skip(
+			"bash on a Windows runner can be WSL's, which has no distribution"
+		);
+	for (const ref of [
+		"refs/tags/v8.0.1-beta.1",
+		"refs/tags/v9.0.0-rc.1",
+		"refs/tags/v8.0.1-0",
+	]) {
+		const { status, stdout, output } = extractVersion(ref);
+		assert.equal(status, 1, `${ref} was not refused`);
+		assert.match(stdout, /::error::Version \S+ is a prerelease/);
+		assert.equal(output, "", `${ref} still handed the publish job a version`);
+	}
+	assert.equal(extractVersion("refs/tags/v8.0.1").output, "version=8.0.1\n");
+	assert.doesNotMatch(
+		WORKFLOW,
+		/prerelease:/,
+		"the GitHub release still has a prerelease switch"
+	);
 });

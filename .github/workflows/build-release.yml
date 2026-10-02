@@ -28,13 +28,18 @@ jobs:
       version: ${{ steps.extract_version.outputs.version }}
     steps:
       # The package version, from the tag alone. The Datadog version is a different number the build reads from
-      # .datadog-agent-version.
+      # .datadog-agent-version. No prerelease is published, so a prerelease tag stops here, before four builds.
       - name: Extract version from tag
         id: extract_version
         shell: bash
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+            version="${GITHUB_REF#refs/tags/v}"
+            if [[ "$version" == *-* ]]; then
+              echo "::error::Version $version is a prerelease, and prereleases are not published. Tag a plain major.minor.patch version."
+              exit 1
+            fi
+            echo "version=$version" >> "$GITHUB_OUTPUT"
           else
             echo "version=" >> "$GITHUB_OUTPUT"
           fi
@@ -314,7 +319,6 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: datadog-agent-binary ${{ github.ref_name }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             release-assets/*
           body: |
