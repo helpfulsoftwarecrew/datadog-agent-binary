@@ -169,7 +169,7 @@ test("NEGATIVE: a prerelease tag stops the release in prepare, with the reason",
 		);
 	for (const ref of [
 		"refs/tags/v8.0.1-beta.1",
-		"refs/tags/v9.0.0-rc.1",
+		"refs/tags/v9.0.0-alpha.1",
 		"refs/tags/v8.0.1-0",
 	]) {
 		const { status, stdout, output } = extractVersion(ref);
