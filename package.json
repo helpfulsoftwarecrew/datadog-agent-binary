@@ -1,6 +1,6 @@
 {
 	"name": "@helpfulsoftwarecrew/datadog-agent-binary",
-	"version": "8.0.0",
+	"version": "8.0.1",
 	"description": "Harper component that runs the Datadog trace-agent and core-agent alongside a node, with pre-built binaries installed per platform",
 	"type": "module",
 	"scripts": {
