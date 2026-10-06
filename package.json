@@ -1,6 +1,6 @@
 {
 	"name": "@helpfulsoftwarecrew/datadog-agent-binary",
-	"version": "8.0.1",
+	"version": "8.0.2",
 	"description": "Harper component that runs the Datadog trace-agent and core-agent alongside a node, with pre-built binaries installed per platform",
 	"type": "module",
 	"scripts": {
@@ -36,7 +36,7 @@
 	"license": "Apache-2.0",
 	"dependencies": {
 		"@helpfulsoftwarecrew/harper-binary-kit": "1.0.2",
-		"@helpfulsoftwarecrew/harper-process-guard": "1.0.1"
+		"@helpfulsoftwarecrew/harper-process-guard": "1.0.2"
 	},
 	"devDependencies": {
 		"@types/node": "^26.5.1",
@@ -71,8 +71,8 @@
 		]
 	},
 	"optionalDependencies": {
-		"@helpfulsoftwarecrew/datadog-agent-binary-linux-x86_64": "8.0.1",
 		"@helpfulsoftwarecrew/datadog-agent-binary-linux-arm64": "8.0.1",
+		"@helpfulsoftwarecrew/datadog-agent-binary-linux-x86_64": "8.0.1",
 		"@helpfulsoftwarecrew/datadog-agent-binary-macos-arm64": "8.0.1",
 		"@helpfulsoftwarecrew/datadog-agent-binary-windows-x86_64": "8.0.1"
 	}
