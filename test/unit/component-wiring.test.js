@@ -296,6 +296,7 @@ test("NEGATIVE: a component the plugin is never called for reports it, and names
 	);
 
 	// Being called at all disarms it, a validation load included: Harper reached the plugin either way.
+	// Harper through 5.3 runs that load; its main branch dropped it (81ed6643c) and never sets the flag.
 	const quiet = await captureLogs(async () => {
 		const component = await withShortDeadline(() => loadComponent());
 		component.handleApplication({ isTransientValidation: true });

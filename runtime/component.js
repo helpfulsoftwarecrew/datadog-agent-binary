@@ -181,7 +181,7 @@ export function notStarted(ports, configEntry) {
 			`nothing has started on this thread. Check first that the node's harper-config.yaml carries ` +
 			`\`${configEntry}\`: Harper calls handleApplication only for a component the root config names, and ` +
 			`a directory it loaded by scanning componentsRoot never reaches it. Otherwise this thread has not ` +
-			`run startup yet, or it ran under a deploy validation load, which starts nothing`,
+			`run startup yet, or on Harper 5.3 or earlier it ran under a deploy validation load, which starts nothing`,
 	};
 }
 

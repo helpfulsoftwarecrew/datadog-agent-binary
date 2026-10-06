@@ -71,6 +71,8 @@ test("NEGATIVE: importing the module starts nothing; only handleApplication does
 	);
 });
 
+// Harper through 5.3 marks a deploy's validation load isTransientValidation; its main branch dropped
+// the load (81ed6643c), so this guards the released lines only.
 test("NEGATIVE: a deploy validation load starts nothing", async () => {
 	await withAgentsAnswering(
 		{ info: SERVING, expvar: CORE_EXPVAR },
